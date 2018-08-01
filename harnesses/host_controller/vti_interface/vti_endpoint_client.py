@@ -15,9 +15,12 @@
 #
 
 import json
+import logging
 import requests
 import threading
 import time
+
+from host_controller.utils.parser import pb2_utils
 
 # Job status dict
 JOB_STATUS_DICT = {
@@ -28,7 +31,16 @@ JOB_STATUS_DICT = {
     # completed job
     "complete": 2,
     # unexpected error during running
-    "infra-err": 3
+    "infra-err": 3,
+    # never leased within schedule period
+    "expired": 4,
+    # device boot error after flashing the given img sets
+    "bootup-err": 5
+}
+
+SCHEDULE_INFO_PB2_ATTR_FILTERS = {
+    "pab_account_id": "device_pab_account_id",
+    "name": "build_target",
 }
 
 
@@ -71,7 +83,7 @@ class VtiEndpointClient(object):
             response = requests.post(url, data=json.dumps(build),
                                      headers=self._headers)
             if response.status_code != requests.codes.ok:
-                print("UploadBuildInfo error: %s" % response)
+                logging.error("UploadBuildInfo error: %s", response)
                 fail = True
         if fail:
             return False
@@ -98,18 +110,25 @@ class VtiEndpointClient(object):
                 "product": device["product"],
                 "status": device["status"]}
             payload["devices"].append(new_device)
-        response = requests.post(url, data=json.dumps(payload),
-                                 headers=self._headers)
+
+        try:
+            response = requests.post(url, data=json.dumps(payload),
+                                     headers=self._headers)
+        except requests.exceptions.ConnectionError as e:
+            logging.exception(e)
+            return False
         if response.status_code != requests.codes.ok:
-            print("UploadDeviceInfo error: %s" % response)
+            logging.error("UploadDeviceInfo error: %s", response)
             return False
         return True
 
-    def UploadScheduleInfo(self, pbs):
+    def UploadScheduleInfo(self, pbs, clear_schedule):
         """Uploads the given schedule information to VTI.
 
         Args:
             pbs: a list of dicts, containing info about all task schedules.
+            clear_schedule: bool, True to clear all schedule data exist on the
+                            scheduler
 
         Returns:
             True if successful, False otherwise.
@@ -119,12 +138,13 @@ class VtiEndpointClient(object):
 
         url = self._url + "schedule_info/v1/clear"
         succ = True
-        response = requests.post(
-            url, data=json.dumps({"manifest_branch": "na"}),
-            headers=self._headers)
-        if response.status_code != requests.codes.ok:
-            print("UploadScheduleInfo error: %s" % response)
-            succ = False
+        if clear_schedule:
+            response = requests.post(
+                url, data=json.dumps({"manifest_branch": "na"}),
+                headers=self._headers)
+            if response.status_code != requests.codes.ok:
+                logging.error("UploadScheduleInfo error: %s", response)
+                succ = False
 
         if not succ:
             return False
@@ -132,34 +152,19 @@ class VtiEndpointClient(object):
         url = self._url + "schedule_info/v1/set"
         for pb in pbs:
             schedule = {}
-            schedule["manifest_branch"] = pb.manifest_branch
-            for build_target in pb.build_target:
-                schedule["build_target"] = build_target.name
-                for test_schedule in build_target.test_schedule:
-                    schedule["test_name"] = test_schedule.test_name
-                    schedule["period"] = test_schedule.period
-                    schedule["priority"] = test_schedule.priority
-                    schedule["device"] = test_schedule.device
-                    schedule["shards"] = test_schedule.shards
-                    schedule["param"] = test_schedule.param
-                    schedule["gsi_branch"] = test_schedule.gsi_branch
-                    schedule["gsi_build_target"] = test_schedule.gsi_build_target
-                    schedule["gsi_pab_account_id"] = test_schedule.gsi_pab_account_id
-                    schedule["test_branch"] = test_schedule.test_branch
-                    schedule["test_build_target"] = test_schedule.test_build_target
-                    schedule["test_pab_account_id"] = test_schedule.test_pab_account_id
-                    response = requests.post(url, data=json.dumps(schedule),
-                                             headers=self._headers)
-                    if response.status_code != requests.codes.ok:
-                        print("UploadScheduleInfo error: %s" % response)
-                        succ = False
+            succ = succ and pb2_utils.FillDictAndPost(
+                pb, schedule, url, self._headers,
+                SCHEDULE_INFO_PB2_ATTR_FILTERS, "UploadScheduleInfo")
+
         return succ
 
-    def UploadLabInfo(self, pbs):
+    def UploadLabInfo(self, pbs, clear_labinfo):
         """Uploads the given lab information to VTI.
 
         Args:
             pbs: a list of dicts, containing info about all known labs.
+            clear_labinfo: bool, True to clear all lab data exist on the
+                           scheduler
 
         Returns:
             True if successful, False otherwise.
@@ -169,11 +174,12 @@ class VtiEndpointClient(object):
 
         url = self._url + "lab_info/v1/clear"
         succ = True
-        response = requests.post(url, data=json.dumps({"name": "na"}),
-                                 headers=self._headers)
-        if response.status_code != requests.codes.ok:
-            print("UploadLabInfo error: %s" % response)
-            succ = False
+        if clear_labinfo:
+            response = requests.post(url, data=json.dumps({"name": "na"}),
+                                     headers=self._headers)
+            if response.status_code != requests.codes.ok:
+                logging.error("UploadLabInfo error: %s", response)
+                succ = False
 
         if not succ:
             return False
@@ -183,24 +189,33 @@ class VtiEndpointClient(object):
             lab = {}
             lab["name"] = pb.name
             lab["owner"] = pb.owner
+            lab["admin"] = []
+            lab["admin"].extend(pb.admin)
             lab["host"] = []
             for host in pb.host:
                 new_host = {}
                 new_host["hostname"] = host.hostname
                 new_host["ip"] = host.ip
                 new_host["script"] = host.script
+                if host.host_equipment:
+                    new_host["host_equipment"] = []
+                    new_host["host_equipment"].extend(host.host_equipment)
                 new_host["device"] = []
                 if host.device:
                     for device in host.device:
                         new_device = {}
                         new_device["serial"] = device.serial
                         new_device["product"] = device.product
+                        if device.device_equipment:
+                            new_device["device_equipment"] = []
+                            new_device["device_equipment"].extend(
+                                device.device_equipment)
                         new_host["device"].append(new_device)
                 lab["host"].append(new_host)
             response = requests.post(url, data=json.dumps(lab),
                                      headers=self._headers)
             if response.status_code != requests.codes.ok:
-                print("UploadLabInfo error: %s" % response)
+                logging.error("UploadLabInfo error: %s", response)
                 succ = False
         return succ
 
@@ -223,17 +238,18 @@ class VtiEndpointClient(object):
         response = requests.post(url, data=json.dumps({"hostname": hostname}),
                                  headers=self._headers)
         if response.status_code != requests.codes.ok:
-            print("LeaseJob error: %s" % response.status_code)
+            logging.error("LeaseJob error: %s", response.status_code)
             return None, {}
 
         response_json = json.loads(response.text)
-        if ("return_code" in response_json and
-            response_json["return_code"] != "SUCCESS"):
-            print("LeaseJob error: %s" % response_json)
+        if ("return_code" in response_json
+                and response_json["return_code"] != "SUCCESS"):
+            logging.debug("LeaseJob error: %s", response_json)
             return None, {}
 
         if "jobs" not in response_json:
-            print("LeaseJob jobs not found in response json %s" % response.text)
+            logging.error(
+                "LeaseJob jobs not found in response json %s", response.text)
             return None, {}
 
         jobs = response_json["jobs"]
@@ -255,7 +271,7 @@ class VtiEndpointClient(object):
             a string which is path to a script file for onecmd().
             a dict contains info on the leased job, will be passed to onecmd().
         """
-        print("Job info : {}".format(json.dumps(job)))
+        logging.info("Job info : {}".format(json.dumps(job)))
         if job is not None:
             self._job = job
             self.StartHeartbeat("leased", 60)
@@ -281,7 +297,7 @@ class VtiEndpointClient(object):
             response = requests.post(url, data=json.dumps(self._job),
                                      headers=self._headers)
             if response.status_code != requests.codes.ok:
-                print("UpdateLeasedJobStatus error: %s" % response)
+                logging.error("UpdateLeasedJobStatus error: %s", response)
             time.sleep(update_interval)
 
     def StartHeartbeat(self, status="leased", update_interval=60):
@@ -292,7 +308,7 @@ class VtiEndpointClient(object):
             update_interval: int, time between heartbeats in second.
         """
         if (self._heartbeat_thread is None
-            or hasattr(self._heartbeat_thread, 'keep_running')):
+                or hasattr(self._heartbeat_thread, 'keep_running')):
             self._heartbeat_thread = threading.Thread(
                 target=self.UpdateLeasedJobStatus,
                 args=(
@@ -302,11 +318,12 @@ class VtiEndpointClient(object):
             self._heartbeat_thread.daemon = True
             self._heartbeat_thread.start()
 
-    def StopHeartbeat(self, status="complete"):
+    def StopHeartbeat(self, status="complete", infra_log_url=""):
         """Stops the hearbeat_thread and sets current job's status.
 
         Args:
             status: string, status value.
+            infra_log_url: string, URL to the uploaded infra log.
         """
         self._heartbeat_thread.keep_running = False
 
@@ -314,13 +331,68 @@ class VtiEndpointClient(object):
             return
 
         url = self._url + "job_queue/v1/heartbeat"
+        self.SetJobStatusFromLeasedTo(status)
+        self._job["infra_log_url"] = infra_log_url
+
+        response = requests.post(
+            url, data=json.dumps(self._job), headers=self._headers)
+        if response.status_code != requests.codes.ok:
+            logging.error("StopHeartbeat error: %s", response)
+
+        self._job = None
+
+    def SetJobStatusFromLeasedTo(self, status):
+        """Sets current job's status only when the job's status is 'leased'.
+
+        Args:
+            status: string, status value.
+        """
         if (self._job is not None and
             self._job["status"] == JOB_STATUS_DICT["leased"]):
             self._job["status"] = JOB_STATUS_DICT[status]
 
-        response = requests.post(url, data=json.dumps(self._job),
-                                 headers=self._headers)
-        if response.status_code != requests.codes.ok:
-            print("StopHeartbeat error: %s" % response)
+    def UploadHostVersion(self, hostname, vtslab_version):
+        """Uploads vtslab version.
 
-        self._job = None
+        Args:
+            hostname: string, the name of the host.
+            vtslab_version: string, current version of vtslab package.
+        """
+        url = self._url + "lab_info/v1/set_version"
+        host = {}
+        host["hostname"] = hostname
+        host["vtslab_version"] = vtslab_version
+
+        try:
+            response = requests.post(url, data=json.dumps(host),
+                                    headers=self._headers)
+        except requests.exceptions.ConnectionError as e:
+            logging.exception(e)
+            return
+        if response.status_code != requests.codes.ok:
+            logging.error("UploadHostVersion error: %s", response)
+
+    def CheckBootUpStatus(self):
+        """Checks whether the device_img + gsi from the job fails to boot up.
+
+        Returns:
+            True if the devices flashed with the given imgs from the leased job
+            succeed to boot up. False otherwise.
+        """
+        if self._job:
+            return (self._job["status"] != JOB_STATUS_DICT["bootup-err"])
+        return False
+
+    def GetJobTestType(self):
+        """Returns the test type of the leased job.
+
+        Returns:
+            int, test_type attr in the job message. 0 when there is no job
+            leased to this vti_endpoint_client.
+        """
+        if self._job and "test_type" in self._job:
+            try:
+                return int(self._job["test_type"])
+            except ValueError as e:
+                logging.exception(e)
+        return 0

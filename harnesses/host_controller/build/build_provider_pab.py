@@ -109,7 +109,8 @@ class BuildProviderPAB(build_provider.BuildProvider):
         """Creates a temp dir."""
         super(BuildProviderPAB, self).__init__()
 
-    def Authenticate(self, userinfo_file=None, noauth_local_webserver=False):
+    def Authenticate(self, userinfo_file=None, noauth_local_webserver=False,
+                     scopes=SCOPE):
         """Authenticate using OAuth2.
 
         Args:
@@ -117,6 +118,7 @@ class BuildProviderPAB(build_provider.BuildProvider):
                            "email" and "password" string fields.
             noauth_local_webserver: boolean, True if do not (or can not) use
                                     a local web server.
+            scopes: string or iterable of strings, the scopes to request.
         """
         # this should be a JSON file with "email" and "password" string fields
         self._userinfo_file = userinfo_file
@@ -127,7 +129,7 @@ class BuildProviderPAB(build_provider.BuildProvider):
         flags, unknown = parser.parse_known_args()
         flags.noauth_local_webserver = noauth_local_webserver
         logging.info('Preparing OAuth token')
-        flow = flow_from_clientsecrets(self.CLIENT_SECRETS, scope=self.SCOPE)
+        flow = flow_from_clientsecrets(self.CLIENT_SECRETS, scope=scopes)
         storage = Storage(self.CLIENT_STORAGE)
         if self._credentials is None:
             self._credentials = storage.get()
@@ -254,7 +256,8 @@ class BuildProviderPAB(build_provider.BuildProvider):
                      page_token="",
                      max_results=10,
                      internal=True,
-                     method=GET):
+                     method=GET,
+                     verify_signed=False):
         """Get the list of builds for a given account, branch and target
         Args:
             account_id: int, ID associated with the PAB account.
@@ -264,6 +267,7 @@ class BuildProviderPAB(build_provider.BuildProvider):
             max_results: maximum build results the build list contains, e.g. 25
             internal: bool, whether to query internal build
             method: 'GET' or 'POST', which endpoint to query
+            verify_signed: bool, whether to verify signed build.
 
         Returns:
             list of dicts representing the builds, descending in time
@@ -281,6 +285,10 @@ class BuildProviderPAB(build_provider.BuildProvider):
             # in listBuild response, index '1' contains builds
             if self.LISTBUILD_BUILD_KEY in result:
                 return result[self.LISTBUILD_BUILD_KEY]
+
+            if verify_signed:
+                logging.error("verify_signed does not support POST method.")
+
             raise ValueError("Build list not found -- %s" % params)
         elif method == GET:
             headers = {}
@@ -297,10 +305,34 @@ class BuildProviderPAB(build_provider.BuildProvider):
             response = requests.get(url, headers=headers)
             try:
                 responseJSON = response.json()
-                return responseJSON['build']
+                builds = responseJSON['build']
             except ValueError as e:
                 logging.exception(e)
                 raise ValueError("Backend error -- check your account ID")
+
+            if verify_signed:
+                for build in builds:
+                    artifact_name = "signed%2Fsigned-{}-img-{}.zip".format(
+                        target.split("-")[0], build["build_id"])
+                    logging.debug("Checking whether the build is signed for "
+                                  "build_target {} and build_id {}".format(
+                                      target, build["build_id"]))
+                    signed_build_url = self.GetArtifactURL(
+                        account_id=account_id,
+                        build_id=build["build_id"],
+                        target=target,
+                        artifact_name=artifact_name,
+                        branch=branch,
+                        internal=False,
+                        method=method)
+                    try:
+                        self.GetResponseWithURL(signed_build_url)
+                        logging.debug("The build is signed.")
+                        build["signed"] = True
+                    except requests.HTTPError:
+                        logging.debug("The build is not signed.")
+                        build["signed"] = False
+            return builds
 
     def GetLatestBuildId(self, account_id, branch, target, method=GET):
         """Get the most recent build_id for a given account, branch and target
@@ -432,11 +464,11 @@ class BuildProviderPAB(build_provider.BuildProvider):
         Returns:
             boolean, whether the file was successfully downloaded
         """
-        headers = {}
-        self._credentials.apply(headers)
-
-        response = requests.get(download_url, headers=headers, stream=True)
-        response.raise_for_status()
+        try:
+            response = self.GetResponseWithURL(download_url)
+        except requests.HTTPError as httpError:
+            logging.exception(httpError)
+            return False
 
         logging.info('%s now downloading...', download_url)
         with open(filename, 'wb') as handle:
@@ -450,7 +482,8 @@ class BuildProviderPAB(build_provider.BuildProvider):
                     target,
                     artifact_name,
                     build_id='latest',
-                    method=GET):
+                    method=GET,
+                    full_device_images=False):
         """Get an artifact for an account, branch, target and name and build id.
 
         If build_id not given, get latest.
@@ -476,7 +509,7 @@ class BuildProviderPAB(build_provider.BuildProvider):
                                              branch=branch,
                                              target=target,
                                              method=method)
-            print("latest build ID = %s" % build_id)
+            logging.info("latest build ID = %s", build_id)
         artifact_info["build_id"] = build_id
 
         if "build_id" in artifact_name:
@@ -516,7 +549,127 @@ class BuildProviderPAB(build_provider.BuildProvider):
             artifact_path = artifact_name
         self.DownloadArtifact(url, artifact_path)
 
-        self.SetFetchedFile(artifact_path)
+        self.SetFetchedFile(
+            artifact_path, full_device_images=full_device_images)
 
         return (self.GetDeviceImage(), self.GetTestSuitePackage(),
                 artifact_info, self.GetConfigPackage())
+
+    def GetSignedBuildArtifact(self,
+                               account_id,
+                               branch,
+                               target,
+                               artifact_name,
+                               build_id='latest',
+                               method=GET,
+                               full_device_images=False):
+        """Get an signed build artifact from the PAB bulid list.
+
+        Args:
+            account_id: int, ID associated with the PAB account.
+            branch: string, branch to pull resource from.
+            target: string, "latest" or a specific version.
+            artifact_name: name of artifact, e.g. aosp_arm64_ab-img-4353141.zip
+                ({id} will automatically get replaced with build ID)
+            build_id: string, build ID of an artifact to fetch (or 'latest').
+            method: 'GET' or 'POST', which endpoint to query.
+
+        Returns:
+            a dict containing the device image info.
+            a dict containing the test suite package info.
+            a dict containing the artifact info.
+            a dict containing the global config info.
+        """
+        artifact_info = {}
+        build_ids = []
+        if build_id == 'latest':
+            build_list = self.GetBuildList(
+                account_id=account_id,
+                branch=branch,
+                target=target,
+                method=method)
+            for build in build_list:
+                build_ids.append(build["build_id"])
+        else:
+            build_ids.append(build_id)
+
+        for build_id in build_ids:
+            _artifact_name = artifact_name
+            if "build_id" in _artifact_name:
+                _artifact_name = _artifact_name.format(build_id=build_id)
+            _artifact_name = "signed%2Fsigned-" + _artifact_name
+            url = self.GetArtifactURL(
+                account_id=account_id,
+                build_id=build_id,
+                target=target,
+                artifact_name=_artifact_name,
+                branch=branch,
+                internal=False,
+                method=method)
+
+            if self.tmp_dirpath:
+                artifact_path = os.path.join(self.tmp_dirpath, _artifact_name)
+            else:
+                artifact_path = _artifact_name
+            ret = self.DownloadArtifact(url, artifact_path)
+
+            if ret:
+                artifact_info["build_id"] = build_id
+                break
+
+        self.SetFetchedFile(
+            artifact_path, full_device_images=full_device_images)
+
+        return (self.GetDeviceImage(), self.GetTestSuitePackage(),
+                artifact_info, self.GetConfigPackage())
+
+    def GetResponseWithURL(self, url):
+        """Gets the response content from the server connected with the url.
+
+        Args:
+            url: A string representing the server url.
+
+        Returns:
+            A Response object received from the server.
+
+        Raises:
+            requests.HTTPError if response.status_code is not 200.
+        """
+        headers = {}
+        self._credentials.apply(headers)
+
+        response = requests.get(url, headers=headers, stream=True)
+        response.raise_for_status()
+
+        return response
+
+    def FetchLatestBuiltHCPackage(self, account_id, branch, target):
+        """Fetchs the latest <artifact_name> file and return the path.
+
+        Args:
+            account_id: string, Partner Android Build account_id to use.
+            branch: string, branch to grab the artifact from.
+            targets: string, a comma-separate list of build target product(s).
+
+        Returns:
+            path to the fetched file. None if the fetching has failed.
+        """
+        listed_builds = self.GetBuildList(
+            account_id=account_id,
+            branch=branch,
+            target=target,
+            page_token="",
+            max_results=1,
+            method="GET")
+        if listed_builds and len(listed_builds) > 0:
+            for listed_build in listed_builds:
+                if listed_build["successful"]:
+                    self.GetArtifact(
+                        account_id=account_id,
+                        branch=branch,
+                        target=target,
+                        artifact_name="android-vtslab.zip",
+                        build_id=listed_build["build_id"],
+                        method="GET")
+
+                    return self.GetHostControllerPackage("vtslab")
