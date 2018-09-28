@@ -264,7 +264,8 @@ def EmitFlashCommands(gsi, **kwargs):
         if shards <= len(serials):
             for shard_index in range(shards):
                 new_cmd_list = []
-                if common.K39TV1_BSP in build_target:
+                if (common.K39TV1_BSP in build_target
+                        or common.K39TV1_BSP_1G in build_target):
                     new_cmd_list.extend(
                         GenerateMt6739GsiFlashingCommands(
                             serials[shard_index], gsi))
@@ -291,7 +292,8 @@ def EmitFlashCommands(gsi, **kwargs):
                 sub_commands.append(new_cmd_list)
         result.append(sub_commands)
     else:
-        if common.K39TV1_BSP in build_target:
+        if (common.K39TV1_BSP in build_target
+                or common.K39TV1_BSP_1G in build_target):
             result.extend(GenerateMt6739GsiFlashingCommands(serials[0], gsi))
         elif common.SDM845 in build_target and gsi:
             result.extend(GenerateSdm845GsiFlashingCommands(serials[0]))
@@ -338,6 +340,8 @@ def EmitCommonConsoleCommands(**kwargs):
     suite_name, plan_name = kwargs["test_name"].split("/")
     serials = kwargs["serial"]
 
+    result.append("device --set_serial=%s --from_job_pool --interval=%s" %
+                  (",".join(serials), common.DEFAULT_DEVICE_TIMEOUT_SECS))
     fetch_commands_result, gsi = EmitFetchCommands(**kwargs)
     result.extend(fetch_commands_result)
     flash_commands_result = EmitFlashCommands(gsi, **kwargs)
@@ -355,9 +359,6 @@ def EmitCommonConsoleCommands(**kwargs):
     else:
         shard_option = "--shards"
         retry_option = ""
-
-    result.append("device --set_serial=%s --from_job_pool --interval=%s" %
-                  (",".join(serials), common.DEFAULT_DEVICE_TIMEOUT_SECS))
 
     if shards > 1:
         test_command = "test --suite %s --keep-result -- %s %s %d %s" % (
@@ -435,8 +436,7 @@ def EmitCommonConsoleCommands(**kwargs):
             upload_commands.append("upload --src={result_full} --dest=%s "
                                    "--clear_dest" % upload_dest)
 
-    if len(upload_commands) > 0:
-        upload_commands[-1] += " --clear_results=True"
+    result.extend(upload_commands)
 
     if HasAttr("report_reference_url", **kwargs):
         ref_urls = kwargs["report_reference_url"]
@@ -452,9 +452,8 @@ def EmitCommonConsoleCommands(**kwargs):
                 sheet_command += " --primary_abi_only"
             if index < len(ref_urls):
                 sheet_command += " --ref " + ref_urls[index]
+            sheet_command += " --client_secrets DATA/vtslab-gcs.json"
             result.append(sheet_command)
-
-    result.extend(upload_commands)
 
     result.append("device --update=stop")
 
@@ -486,7 +485,7 @@ def GenerateSdm845SetupCommands(serial):
         "fastboot -s %s flash dtbo {device-image[full-zipfile-dir]}/dtbo.img" %
         serial)
     result.append(
-        "fastboot -s %s flash system {device-image[full-zipfile-dir]}/system.img"
+        "fastboot --timeout=900 -s %s flash system {device-image[full-zipfile-dir]}/system.img"
         % serial)
     result.append(
         "fastboot -s %s flash userdata {device-image[full-zipfile-dir]}/userdata.img"
@@ -556,7 +555,8 @@ def GenerateSdm845GsiFlashingCommands(serial, repacked_imageset=False):
             "fastboot -s %s flash vendor {device-image[vendor.img]}" % serial)
 
     result.append(
-        "fastboot -s %s flash system {device-image[system.img]}" % serial)
+        "fastboot --timeout=900 -s %s flash system {device-image[system.img]}"
+        % serial)
     # removed -w from below command
     result.append("fastboot -s %s -- reboot" % serial)
     result.append("sleep 90")  # wait until adb shell (not boot complete)
@@ -611,25 +611,34 @@ def GenerateMt6739GsiFlashingCommands(serial,
     """
     flash_img_cmd = ("fastboot -s %s flash %s "
                      "{device-image[full-zipfile-dir]}/%s")
-    flash_gsi_cmd = ("fastboot -s %s flash system "
-                     "{device-image[gsi-zipfile-dir]}/system.img")
+    flash_gsi_cmd = ("fastboot --timeout=900 -s %s flash system "
+                     "{device-image[system.img]}")
     result = [
         flash_img_cmd % (serial, partition, image)
         for partition, image in (
+            ("preloader", "preloader_SBOOT_DIS.img"),
+            ("loader_ext1", "loader_ext.img"),
+            ("loader_ext2", "loader_ext.img"),
+            ("tee1", "tee.img"),
+            ("tee2", "tee.img"),
             ("lk", "lk.img"),
+            ("lk2", "lk.img"),
+        )
+    ]
+    result.append("fastboot -s %s -- reboot bootloader" % serial)
+    # gpt is the partition table and must be flashed first.
+    # The bootloader reloads partition table automatically after flashing gpt.
+    result += [
+        flash_img_cmd % (serial, partition, image)
+        for partition, image in (
+            ("gpt", "PGPT"),
             ("md1img", "md1img.img"),
             ("md1dsp", "md1dsp.img"),
-            ("preloader", "preloader.img"),
             ("recovery", "recovery.img"),
             ("spmfw", "spmfw.img"),
             ("mcupmfw", "mcupmfw.img"),
-            ("lk2", "lk.img"),
-            ("loader_ext1", "loader_ext.img"),
-            ("loader_ext2", "loader_ext.img"),
             ("boot", "boot.img"),
-            ("odmdtbo", "odmdtbo.img"),
-            ("tee1", "tee.img"),
-            ("tee2", "tee.img"),
+            ("dtbo", "dtbo.img"),
             ("vendor", "vendor.img"),
             ("cache", "cache.img"),
             ("userdata", "userdata.img"),
@@ -640,6 +649,7 @@ def GenerateMt6739GsiFlashingCommands(serial,
         result.append(flash_gsi_cmd % serial)
         result.append("fastboot -s %s -- -w" % serial)
     else:
+        flash_img_cmd += " --timeout=900"
         result.append(flash_img_cmd % (serial, "system", "system.img"))
 
     result.append("fastboot -s %s reboot" % serial)
@@ -684,11 +694,11 @@ def GenerateUniversal9810GsiFlashingCommands(serial,
     ]
     if gsi:
         result.append(
-            ("fastboot -s %s flash system "
-             "{device-image[gsi-zipfile-dir]}/system.img -- -S 512M" % serial))
+            ("fastboot --timeout=900 -s %s flash system "
+             "{device-image[system.img]} -- -S 512M" % serial))
     else:
         result.append((
-            "fastboot -s %s flash system "
+            "fastboot --timeout=900 -s %s flash system "
             "{device-image[full-zipfile-dir]}/system.img -- -S 512M" % serial))
     result.append("fastboot -s %s reboot -- -w" % serial)
     if not repacked_imageset:
@@ -699,6 +709,7 @@ def GenerateUniversal9810GsiFlashingCommands(serial,
 
 FLASH_COMMAND_EMITTER = {
     common.K39TV1_BSP: GenerateMt6739GsiFlashingCommands,
+    common.K39TV1_BSP_1G: GenerateMt6739GsiFlashingCommands,
     common.SDM845: GenerateSdm845GsiFlashingCommands,
     common.UNIVERSAL9810: GenerateUniversal9810GsiFlashingCommands,
 }

@@ -85,6 +85,7 @@ _DEFAULT_WIFI_AP = "GoogleGuest"
 
 # SoC name list.
 K39TV1_BSP = "k39tv1_bsp"
+K39TV1_BSP_1G = "k39tv1_bsp_1g"
 
 SDM845 = "sdm845"
 
@@ -203,3 +204,6 @@ _DEVLOCK_DIR = ".devlock"
 
 # Default timeout for "adb reboot/fastboot getvar" command in secs.
 DEFAULT_DEVICE_TIMEOUT_SECS = 300
+
+# Maximum number of concurrent adb/fastboot processes.
+MAX_ADB_FASTBOOT_PROCESS = 2

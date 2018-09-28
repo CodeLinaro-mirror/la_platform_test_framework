@@ -18,6 +18,8 @@ import logging
 
 from host_controller import common
 from host_controller.command_processor import base_command_processor
+from host_controller.utils.ipc import file_lock_semaphore
+from host_controller.utils.usb import usb_utils
 
 from vts.utils.python.common import cmd_utils
 
@@ -37,6 +39,7 @@ class CommandFastboot(base_command_processor.BaseCommandProcessor):
     # @Override
     def SetUp(self):
         """Initializes the parser for device command."""
+        self.sem_fastboot = file_lock_semaphore.FileLockSemaphore("fastboot")
         self.arg_parser.add_argument(
             "--serial",
             "-s",
@@ -48,6 +51,12 @@ class CommandFastboot(base_command_processor.BaseCommandProcessor):
             type=int,
             default=2,
             help="The number of times to retry if a command fails.")
+        self.arg_parser.add_argument(
+            "--timeout",
+            type=float,
+            default=common.DEFAULT_DEVICE_TIMEOUT_SECS,
+            help="The maximum timeout value of this command in seconds. "
+            "Set to 0 to disable the timeout functionality.")
         self.arg_parser.add_argument(
             "command",
             metavar="COMMAND",
@@ -69,7 +78,14 @@ class CommandFastboot(base_command_processor.BaseCommandProcessor):
         cmd_list.extend(self.ReplaceVars(args.command))
         cmd = " ".join(cmd_list)
         for _ in range(args.retry + 1):
-            stdout, stderr, retcode = cmd_utils.ExecuteOneShellCommand(cmd)
+            self.sem_fastboot.Acquire()
+            if args.timeout == 0:
+                stdout, stderr, retcode = cmd_utils.ExecuteOneShellCommand(cmd)
+            else:
+                stdout, stderr, retcode = cmd_utils.ExecuteOneShellCommand(
+                    cmd, args.timeout,
+                    usb_utils.ResetUsbDeviceOfSerial_Callback, args.serial)
+            self.sem_fastboot.Release()
             if stdout:
                 logging.info(stdout)
             if stderr:
